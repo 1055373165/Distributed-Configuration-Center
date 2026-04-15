@@ -32,7 +32,7 @@ type Entry struct {
 	Revision       uint64 `json:"revision"`
 	CreateRevision uint64 `json:"create_revision"`
 	ModRevision    uint64 `json:"mod_revision"`
-	Version        int64  `json:"version"`
+	Version        uint64 `json:"version"`
 }
 
 // PutResult is returned after a succesfful Put.
