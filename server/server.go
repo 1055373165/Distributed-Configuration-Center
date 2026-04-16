@@ -12,9 +12,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"just_for_test_only_once/paladin-core/store"
 	"log"
 	"net/http"
+	"paladin-core/store"
 	"strings"
 )
 
@@ -48,7 +48,7 @@ func (s *Server) routes() {
 // configKey builds the internal store key from URL path segments.
 // Path format: /api/v1/config/{tenant}/{namespace}/{name}
 // Store key: {tenant}/{namespace}/{name}
-func configKey(path string) (segment, namespace, name string, err error) {
+func configKey(path string) (tenant, namespace, name string, err error) {
 	// Strip the prefix "/api/v1/config/"
 	trimmed := strings.TrimPrefix(path, "/api/v1/config/")
 	trimmed = strings.TrimSuffix(trimmed, "/")
@@ -111,7 +111,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, tenant, namespace, name string) {
-	key := configKey(tenant, namespace, name)
+	key := storeKey(tenant, namespace, name)
 	entry, err := s.store.Get(key)
 	if err != nil {
 		if err == store.ErrKeyNotFound {
@@ -157,7 +157,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, tenant, names
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, tenant, namespace, name string) {
-	key := configKey(tenant, namespace, name)
+	key := storeKey(tenant, namespace, name)
 
 	deleted, err := s.store.Delete(key)
 	if err != nil {
@@ -177,11 +177,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, tenant, na
 	log.Printf("[DELETE] %s rev=%d", key, s.store.Rev())
 }
 
-func (s *Server) handleGetAll(w http.ResponseWriter, r *http.Request, tenant, namespace string) {
+func (s *Server) handleList(w http.ResponseWriter, _ *http.Request, tenant, namespace string) {
 	prefix := listPrefix(tenant, namespace)
 	entries, err := s.store.List(prefix)
 	if err != nil {
-		httpErorr(w, http.StatusInternalServerError, "list: %v", err)
+		httpError(w, http.StatusInternalServerError, "list: %v", err)
 		return
 	}
 

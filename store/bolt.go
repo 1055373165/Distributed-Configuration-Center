@@ -97,7 +97,7 @@ func (s *BoltStore) Put(key string, value []byte) (*PutResult, error) {
 			// Update existing key.
 			entry.CreateRevision = prev.CreateRevision
 			entry.ModRevision = newRev
-			entry.Version = entry.Version + 1
+			entry.Version = prev.Version + 1
 			result.PrevEntry = prev
 		} else {
 			// First creation.

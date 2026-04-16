@@ -10,8 +10,8 @@ package main
 
 import (
 	"fmt"
-	"just_for_test_only_once/paladin-core/store"
 	"os"
+	"paladin-core/store"
 )
 
 const defaultDBPath = "paladin-core.db"
