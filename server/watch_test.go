@@ -29,4 +29,7 @@ func TestWatchReturnsEventsImmediately(t *testing.T) {
 	if len(resp.Events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(resp.Events))
 	}
+	if resp.Events[0].Type != "PUT" {
+		t.Fatalf("expected ")
+	}
 }
