@@ -21,12 +21,18 @@ import (
 // Server is the HTTP API server for PaladinCore.
 type Server struct {
 	store store.Store
+	wc    *store.WatchCache
 	mux   *http.ServeMux
 }
 
 // New creates a new Server backend by the given Store.
+// If the store is a Watchable Store, the watch endpoint is enabled.
 func New(s store.Store) *Server {
 	srv := &Server{store: s, mux: http.NewServeMux()}
+	// If the store is watchable, grab the WatchCache.
+	if ws, ok := s.(*store.WatchableStore); ok {
+		srv.wc = ws.WatchCache()
+	}
 	srv.routes()
 	return srv
 }
@@ -39,6 +45,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/v1/config/", s.handleConfig)
 	s.mux.HandleFunc("/api/v1/rev", s.handleRev)
+	if s.wc != nil {
+		s.registerWatchRoutes()
+	}
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
