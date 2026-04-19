@@ -109,6 +109,27 @@ func NewNode(config NodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("create raft: %w", err)
 	}
 
+	// Bootstrap a brand-new single-node cluster on first boot. Only valid when
+	// no on-disk state exists; subsequent restarts must skip this so the node
+	// rejoins via persisted configuration instead of starting a fresh term.
+	if config.Bootstrap {
+		hasState, err := raft.HasExistingState(logStore, logStore, snapshotStore)
+		if err != nil {
+			return nil, fmt.Errorf("check existing state: %w", err)
+		}
+		if !hasState {
+			cfg := raft.Configuration{
+				Servers: []raft.Server{{
+					ID:      raftConfig.LocalID,
+					Address: transport.LocalAddr(),
+				}},
+			}
+			if err := r.BootstrapCluster(cfg).Error(); err != nil {
+				return nil, fmt.Errorf("bootstrap cluster: %w", err)
+			}
+		}
+	}
+
 	return &Node{
 		config: config,
 		raft:   r,
