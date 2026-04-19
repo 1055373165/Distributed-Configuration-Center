@@ -9,10 +9,12 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	praft "paladin-core/raft"
 	"paladin-core/server"
 	"paladin-core/store"
 )
@@ -32,6 +34,8 @@ func main() {
 		runCLI(cmd)
 	case "serve":
 		runStandalone()
+	case "cluster":
+		runCluster()
 	default:
 		usage()
 		os.Exit(1)
@@ -106,6 +110,57 @@ func runCLI(cmd string) {
 		}
 	case "rev":
 		fmt.Printf("rev=%d\n", s.Rev())
+	}
+}
+
+func runCluster() {
+	fs := flag.NewFlagSet("cluster", flag.ExitOnError)
+	nodeID := fs.String("id", "", "Node ID (required)")
+	raftAddr := fs.String("raft", "127.0.0.1:9001", "Raft bind address")
+	httpAddr := fs.String("http", ":8080", "HTTP listen address")
+	dataDir := fs.String("data", "", "Data directory (default: data-{id})")
+	bootstrap := fs.Bool("bootstrap", false, "Bootstrap as initial leader")
+	join := fs.String("join", "", "Leader HTTP address to join (e.g., localhost:8080)")
+	fs.Parse(os.Args[2:])
+
+	if *nodeID == "" {
+		fatal("---id is required")
+	}
+	if *dataDir == "" {
+		*dataDir = fmt.Sprintf("data-%s", *nodeID)
+	}
+
+	node, err := praft.NewNode(praft.NodeConfig{
+		NodeID:    *nodeID,
+		BindAddr:  *raftAddr,
+		DataDir:   *dataDir,
+		Bootstrap: *bootstrap,
+	})
+	if err != nil {
+		fatal("create raft node: %v", err)
+	}
+	defer node.Shutdown()
+
+	srv := server.NewRaftServer(node)
+
+	// If --join specified, request to join the cluster.
+	if *join != "" {
+		url := fmt.Sprintf("http://%s/admin/join?id=%s&addr=%s", *join, *nodeID, *raftAddr)
+		resp, err := http.Post(url, "", nil)
+		if err != nil {
+			fatal("join cluster: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			fatal("join cluster: status %d", resp.StatusCode)
+		}
+		log.Printf("Joined cluster via %s", *join)
+	}
+
+	log.Printf("PaladinCore [raft] node=%s raft=%s http=%s bootstrap=%v",
+		*nodeID, *raftAddr, *httpAddr, *bootstrap)
+	if err := http.ListenAndServe(*httpAddr, srv); err != nil {
+		fatal("listen: %v", err)
 	}
 }
 

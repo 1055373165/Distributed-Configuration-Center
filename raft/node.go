@@ -146,6 +146,69 @@ func (n *Node) Apply(op Op, timeout time.Duration) (*OpResult, error) {
 	return result, nil
 }
 
+// Get reads directly from the local store  (allows stale reads on Followers.)
+func (n *Node) Get(key string) (*store.Entry, error) {
+	return n.store.Get(key)
+}
+
+// List reads directly from the local store.
+func (n *Node) List(prefix string) ([]*store.Entry, error) {
+	return n.store.List(prefix)
+}
+
+// Rev returns the current store revision.
+func (n *Node) Rev() uint64 {
+	return n.store.Rev()
+}
+
+// Store returns the underlying WatchableStore.
+func (n *Node) Store() *store.WatchableStore {
+	return n.store
+}
+
+// IsLeader returns true if this node is the Raft leader.
+func (n *Node) IsLeader() bool {
+	return n.raft.State() == raft.Leader
+}
+
+// LeaderAddr returns the address of the current leader.
+func (n *Node) LeaderAddr() string {
+	addr, _ := n.raft.LeaderWithID()
+	return string(addr)
+}
+
+// Join adds a new node to the Raft cluster. Must be called on the Leader.
+func (n *Node) Join(nodeID, addr string) error {
+	if !n.IsLeader() {
+		return ErrNotLeader
+	}
+	f := n.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, 10*time.Second)
+	return f.Error()
+}
+
+// Leave removes a node from the Raft cluster.
+func (n *Node) Leave(nodeID string) error {
+	if !n.IsLeader() {
+		return ErrNotLeader
+	}
+	f := n.raft.RemoveServer(raft.ServerID(nodeID), 0, 10*time.Second)
+	return f.Error()
+}
+
+// Shutdown gracefully stops the Raft node.
+func (n *Node) Shutdown() error {
+	f := n.raft.Shutdown()
+	if err := f.Error(); err != nil {
+		return err
+	}
+	return n.store.Close()
+}
+
+// Stats returns Raft statistics.
+func (n *Node) Stats() map[string]string {
+	return n.raft.Stats()
+}
+
 // ErrNotLeader is returned when a write is attempted on a non-leader node.
 var ErrNotLeader = fmt.Errorf("not the leader")
 
