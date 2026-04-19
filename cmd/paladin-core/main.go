@@ -9,9 +9,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"paladin-core/server"
 	"paladin-core/store"
+	"syscall"
+	"time"
 )
 
 const defaultDBPath = "paladin-core.db"
@@ -27,10 +35,51 @@ func main() {
 	switch cmd {
 	case "put", "get", "delete", "list", "rev":
 		runCLI(cmd)
+	case "serve":
+		addr := ":8080"
+		if len(os.Args) >= 3 {
+			addr = os.Args[2]
+		}
+		runServe(addr)
 	default:
 		usage()
 		os.Exit(1)
 	}
+}
+
+func runServe(addr string) {
+	s, err := store.NewBoltStore(defaultDBPath)
+	if err != nil {
+		fatal("open store: %v", err)
+	}
+	defer s.Close()
+
+	httpSrv := &http.Server{
+		Addr:    addr,
+		Handler: server.New(s),
+	}
+
+	idleClosed := make(chan struct{})
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigCh
+		log.Printf("received signal %s, shutting down...", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
+		close(idleClosed)
+	}()
+
+	log.Printf("PaladinCore HTTP server listening on %s (db=%s)", addr, defaultDBPath)
+	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fatal("http server: %v", err)
+	}
+	<-idleClosed
+	log.Println("server stopped")
 }
 
 func runCLI(cmd string) {
