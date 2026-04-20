@@ -187,10 +187,58 @@ func (n *Node) IsLeader() bool {
 	return n.raft.State() == raft.Leader
 }
 
-// LeaderAddr returns the address of the current leader.
+// LeaderAddr returns the Raft transport address of the current leader.
+// NOTE: this is the binary-protocol Raft port, NOT the HTTP port. Use
+// LeaderHTTPAddr for forwarding client requests.
 func (n *Node) LeaderAddr() string {
 	addr, _ := n.raft.LeaderWithID()
 	return string(addr)
+}
+
+// PeerHTTPPrefix is the reserved store prefix where each node's HTTP
+// advertise address is stored as "<prefix><nodeID>" → addr. Stored as
+// regular store entries so they ride existing Raft replication and
+// snapshots, surviving restarts and leader failover.
+const PeerHTTPPrefix = "__paladin/peers/"
+
+// LeaderHTTPAddr returns the HTTP advertise address of the current leader,
+// or "" if no leader is known yet or its address has not been registered.
+func (n *Node) LeaderHTTPAddr() string {
+	_, id := n.raft.LeaderWithID()
+	if id == "" {
+		return ""
+	}
+	e, err := n.store.Get(PeerHTTPPrefix + string(id))
+	if err != nil {
+		return ""
+	}
+	return string(e.Value)
+}
+
+// RegisterPeerHTTP records a node's HTTP advertise address through Raft.
+// Must be called on the leader; followers will see the entry once replicated.
+func (n *Node) RegisterPeerHTTP(nodeID, httpAddr string) error {
+	_, err := n.Apply(Op{
+		Type:  "put",
+		Key:   PeerHTTPPrefix + nodeID,
+		Value: []byte(httpAddr),
+	}, 5*time.Second)
+	return err
+}
+
+// WaitForLeader blocks until any node (possibly self) is elected leader,
+// or the timeout fires.
+func (n *Node) WaitForLeader(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, id := n.raft.LeaderWithID(); id != "" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for leader")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // Join adds a new node to the Raft cluster. Must be called on the Leader.

@@ -17,6 +17,8 @@ import (
 	praft "paladin-core/raft"
 	"paladin-core/server"
 	"paladin-core/store"
+	"strings"
+	"time"
 )
 
 const defaultDBPath = "paladin-core.db"
@@ -143,9 +145,19 @@ func runCluster() {
 
 	srv := server.NewRaftServer(node)
 
+	// Compute the externally-reachable HTTP addr to advertise to peers.
+	// `:PORT` form means "listen on all interfaces", so for the advertise
+	// addr we substitute 127.0.0.1 (good enough for local clusters; real
+	// deployments should add an --advertise-http flag).
+	advertiseHTTP := *httpAddr
+	if strings.HasPrefix(advertiseHTTP, ":") {
+		advertiseHTTP = "127.0.0.1" + advertiseHTTP
+	}
+
 	// If --join specified, request to join the cluster.
 	if *join != "" {
-		url := fmt.Sprintf("http://%s/admin/join?id=%s&addr=%s", *join, *nodeID, *raftAddr)
+		url := fmt.Sprintf("http://%s/admin/join?id=%s&addr=%s&http=%s",
+			*join, *nodeID, *raftAddr, advertiseHTTP)
 		resp, err := http.Post(url, "", nil)
 		if err != nil {
 			fatal("join cluster: %v", err)
@@ -155,6 +167,25 @@ func runCluster() {
 			fatal("join cluster: status %d", resp.StatusCode)
 		}
 		log.Printf("Joined cluster via %s", *join)
+	}
+
+	// Bootstrap node self-registers its HTTP addr once it wins election so
+	// followers can resolve LeaderHTTPAddr() and forward writes.
+	if *bootstrap {
+		go func() {
+			if err := node.WaitForLeader(10 * time.Second); err != nil {
+				log.Printf("self-register: %v", err)
+				return
+			}
+			if !node.IsLeader() {
+				return // someone else became leader (shouldn't happen on bootstrap)
+			}
+			if err := node.RegisterPeerHTTP(*nodeID, advertiseHTTP); err != nil {
+				log.Printf("self-register: %v", err)
+				return
+			}
+			log.Printf("Self-registered %s -> %s", *nodeID, advertiseHTTP)
+		}()
 	}
 
 	log.Printf("PaladinCore [raft] node=%s raft=%s http=%s bootstrap=%v",

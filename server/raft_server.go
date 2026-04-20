@@ -140,17 +140,21 @@ func (rs *RaftServer) handleRaftDelete(w http.ResponseWriter, r *http.Request, t
 // and if that node is a Follower, the request is transparently forwarded
 // to the Leader. The client never needs to know cluster topology.
 func (rs *RaftServer) forwardToLeader(w http.ResponseWriter, r *http.Request, body []byte) {
-	leaderAddr := rs.node.LeaderAddr()
-	if leaderAddr == "" {
-		// No leader avaiable - backoff and retry.
-		// In production, this would do exponential backoff covering
-		// the ~1-3s leader election window.
-		httpError(w, http.StatusServiceUnavailable, "no leader avaiable, try again later")
+	// Use the leader's HTTP advertise address (NOT LeaderAddr, which is the
+	// Raft transport port that speaks a binary protocol).
+	leaderHTTP := rs.node.LeaderHTTPAddr()
+	if leaderHTTP == "" {
+		// Either no leader yet, or the leader hasn't been registered in the
+		// peer-HTTP map. The latter happens briefly right after bootstrap or
+		// failover; client should retry.
+		httpError(w, http.StatusServiceUnavailable,
+			"leader http addr unknown (leader_raft=%q), try again later",
+			rs.node.LeaderAddr())
 		return
 	}
 
-	// Bhild forwarded request.
-	url := fmt.Sprintf("http://%s%s", leaderAddr, r.URL.String())
+	// Build forwarded request.
+	url := fmt.Sprintf("http://%s%s", leaderHTTP, r.URL.String())
 	var bodyReader io.Reader
 	if body != nil {
 		bodyReader = bytes.NewReader(body)
@@ -171,7 +175,7 @@ func (rs *RaftServer) forwardToLeader(w http.ResponseWriter, r *http.Request, bo
 
 	resp, err := http.DefaultClient.Do(fwdReq)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "forward to leader %s: %v", leaderAddr, err)
+		httpError(w, http.StatusBadRequest, "forward to leader %s: %v", leaderHTTP, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -185,7 +189,7 @@ func (rs *RaftServer) forwardToLeader(w http.ResponseWriter, r *http.Request, bo
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
-	log.Printf("[FORWARD] %s %s -> leader %s (status %d)", r.Method, r.URL.Path, leaderAddr, resp.StatusCode)
+	log.Printf("[FORWARD] %s %s -> leader %s (status %d)", r.Method, r.URL.Path, leaderHTTP, resp.StatusCode)
 }
 
 // --- Admin Endpoints (Day 5/7) ---
@@ -196,16 +200,23 @@ func (rs *RaftServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	nodeID := r.URL.Query().Get("id")
 	addr := r.URL.Query().Get("addr")
-	if nodeID == "" || addr == "" {
-		httpError(w, http.StatusBadRequest, "id and addr required")
+	httpAddr := r.URL.Query().Get("http")
+	if nodeID == "" || addr == "" || httpAddr == "" {
+		httpError(w, http.StatusBadRequest, "id, addr, http required")
 		return
 	}
 	if err := rs.node.Join(nodeID, addr); err != nil {
 		httpError(w, http.StatusInternalServerError, "join: %v", err)
 		return
 	}
+	// Replicate the joiner's HTTP advertise address so every node can
+	// resolve where to forward writes when the leader changes.
+	if err := rs.node.RegisterPeerHTTP(nodeID, httpAddr); err != nil {
+		httpError(w, http.StatusInternalServerError, "register http addr: %v", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "joined": nodeID})
-	log.Printf("[ADMIN] node %s (%s) joined", nodeID, addr)
+	log.Printf("[ADMIN] node %s raft=%s http=%s joined", nodeID, addr, httpAddr)
 }
 
 func (rs *RaftServer) handleLeave(w http.ResponseWriter, r *http.Request) {
