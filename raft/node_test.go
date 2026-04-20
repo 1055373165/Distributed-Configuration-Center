@@ -55,13 +55,22 @@ func TestRaftPutAndGet(t *testing.T) {
 func TestRaftDelete(t *testing.T) {
 	n := singleNode(t)
 
-	n.Apply(Op{Type: "delete", Key: "temp", Value: []byte("val")}, 5*time.Second)
-	result, err := n.Apply(Op{Type: "get", Key: "temp"}, 5*time.Second)
+	_, err := n.Apply(Op{Type: "put", Key: "temp", Value: []byte("val")}, 5*time.Second)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("put error:", err)
 	}
-	if string(result.Entry.Value) != "val" {
-		t.Fatalf("expected value 'val', got '%s'", string(result.Entry.Value))
+
+	entry, err := n.Get("temp")
+	if err != nil {
+		t.Fatal("get error:", err)
+	}
+	if string(entry.Value) != "val" {
+		t.Fatalf("expected value 'val', got '%s'", string(entry.Value))
+	}
+
+	_, err = n.Apply(Op{Type: "delete", Key: "temp"}, 5*time.Second)
+	if err != nil {
+		t.Fatal("delete error:", err)
 	}
 
 	_, err = n.Get("temp")
