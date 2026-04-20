@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -17,14 +18,20 @@ type RaftServer struct {
 
 // NewRaftServer creates a Raft-aware HTTP server.
 func NewRaftServer(node *praft.Node) *RaftServer {
-	// Build the base server (without /api/v1/config/) using the node's WatchableStore.
+	// Build the base server WITHOUT /api/v1/config/ — newBase skips it so
+	// we can install the Raft-aware handler here without a duplicate-pattern
+	// panic from net/http.ServeMux. Do NOT switch this to New(...).
 	base := newBase(node.Store())
 
 	rs := &RaftServer{Server: base, node: node}
 
 	// Install the Raft-aware config handler.
 	rs.mux.HandleFunc("/api/v1/config/", rs.handleRaftConfig)
-
+	// Watch still works the same (reads from WatchCache).
+	// Admin endpoints.
+	rs.mux.HandleFunc("/admin/join", rs.handleJoin)
+	rs.mux.HandleFunc("/admin/leave", rs.handleLeave)
+	rs.mux.HandleFunc("/admin/stats", rs.handleStats)
 	return rs
 }
 
@@ -74,6 +81,12 @@ func (rs *RaftServer) handleRaftPut(w http.ResponseWriter, r *http.Request, tena
 
 	key := storeKey(tenant, namespace, name)
 
+	// If not leader, forward to leader.
+	if !rs.node.IsLeader() {
+		rs.forwardToLeader(w, r, body)
+		return
+	}
+
 	op := praft.Op{Type: "put", Key: key, Value: body}
 	result, err := rs.node.Apply(op, 5*time.Second)
 	if err != nil {
@@ -97,6 +110,12 @@ func (rs *RaftServer) handleRaftPut(w http.ResponseWriter, r *http.Request, tena
 func (rs *RaftServer) handleRaftDelete(w http.ResponseWriter, r *http.Request, tenant, namespace, name string) {
 	key := storeKey(tenant, namespace, name)
 
+	// If not leader, forward to leader.
+	if !rs.node.IsLeader() {
+		rs.forwardToLeader(w, r, nil)
+		return
+	}
+
 	op := praft.Op{Type: "delete", Key: key}
 	result, err := rs.node.Apply(op, 5*time.Second)
 	if err != nil {
@@ -113,4 +132,104 @@ func (rs *RaftServer) handleRaftDelete(w http.ResponseWriter, r *http.Request, t
 		Configs:  []*ConfigItem{entryToConfig(result.Entry)},
 	})
 	log.Printf("[RAFT DELETE] %s", key)
+}
+
+// forwardToLeader proxies the request to the current Raft leader.
+//
+// This is the core of "ForwardRPC" - the client connects to any node,
+// and if that node is a Follower, the request is transparently forwarded
+// to the Leader. The client never needs to know cluster topology.
+func (rs *RaftServer) forwardToLeader(w http.ResponseWriter, r *http.Request, body []byte) {
+	leaderAddr := rs.node.LeaderAddr()
+	if leaderAddr == "" {
+		// No leader avaiable - backoff and retry.
+		// In production, this would do exponential backoff covering
+		// the ~1-3s leader election window.
+		httpError(w, http.StatusServiceUnavailable, "no leader avaiable, try again later")
+		return
+	}
+
+	// Bhild forwarded request.
+	url := fmt.Sprintf("http://%s%s", leaderAddr, r.URL.String())
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
+	}
+	fwdReq, err := http.NewRequestWithContext(r.Context(), r.Method, url, bodyReader)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "build forward request: %v", err)
+		return
+	}
+
+	// Forward headers.
+	for k, vs := range r.Header {
+		for _, v := range vs {
+			fwdReq.Header.Add(k, v)
+		}
+	}
+	fwdReq.Header.Set("X-Forwarded-By", rs.node.Stats()["id"])
+
+	resp, err := http.DefaultClient.Do(fwdReq)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "forward to leader %s: %v", leaderAddr, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy leader response back to client.
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+
+	log.Printf("[FORWARD] %s %s -> leader %s (status %d)", r.Method, r.URL.Path, leaderAddr, resp.StatusCode)
+}
+
+// --- Admin Endpoints (Day 5/7) ---
+func (rs *RaftServer) handleJoin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	nodeID := r.URL.Query().Get("id")
+	addr := r.URL.Query().Get("addr")
+	if nodeID == "" || addr == "" {
+		httpError(w, http.StatusBadRequest, "id and addr required")
+		return
+	}
+	if err := rs.node.Join(nodeID, addr); err != nil {
+		httpError(w, http.StatusInternalServerError, "join: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "joined": nodeID})
+	log.Printf("[ADMIN] node %s (%s) joined", nodeID, addr)
+}
+
+func (rs *RaftServer) handleLeave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+
+	nodeID := r.URL.Query().Get("id")
+	if nodeID == "" {
+		httpError(w, http.StatusBadRequest, "id required")
+		return
+	}
+	if err := rs.node.Leave(nodeID); err != nil {
+		httpError(w, http.StatusInternalServerError, "leave: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "removed": nodeID})
+	log.Printf("[ADMIN] node %s left", nodeID)
+}
+
+func (rs *RaftServer) handleStats(w http.ResponseWriter, r *http.Request) {
+	stats := rs.node.Stats()
+	stats["store_revision"] = fmt.Sprintf("%d", rs.node.Rev())
+	stats["is_leader"] = fmt.Sprintf("%v", rs.node.IsLeader())
+	writeJSON(w, http.StatusOK, stats)
 }
