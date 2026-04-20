@@ -159,28 +159,6 @@ PaladinCore stacks five thin layers. Each layer has one job and exactly one upst
 
 ---
 
-## Core workflows (Mermaid sequence diagrams)
-
-### 1. Write with transparent leader forwarding
-
-The client hits any node. If that node isn't the Leader, it proxies the HTTP request to the Leader. The Leader replicates the op through Raft; once a quorum ACKs, the FSM applies it to every node's local store and wakes watchers.
-
-![alt text](resources/mermaid-diagram-2026-04-20-160346.svg)
-
-### 2. Watch via HTTP long polling
-
-The SDK sends its last known revision. If new events already exist in the ring buffer, the server returns immediately. Otherwise it blocks on `sync.Cond.Wait()` until the next write broadcasts, or until timeout (max 60s), whichever comes first.
-
-![alt text](resources/mermaid-diagram-2026-04-20-160616.svg)
-
-### 3. SDK three-phase lifecycle (startup → runtime → shutdown)
-
-The SDK treats the config center as unreliable: it falls back to a checksummed local cache when the full pull fails, retries with backoff on transient errors, and guarantees no in-flight callbacks outlive `Close()`.
-
-![alt text](resources/mermaid-diagram-2026-04-20-160721.svg)
-
----
-
 ## HTTP API
 
 Paths follow the Kubernetes-style hierarchy `/{tenant}/{namespace}/{name}`.
