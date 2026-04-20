@@ -113,7 +113,7 @@
 
 ## 2. 重构原则与不变量
 
-### 2.1 八条硬约束（违反即拒 PR）
+### 2.1 九条硬约束（违反即拒 PR）
 
 1. **Wire 格式向后兼容。** pb schema 一旦落地只加字段、tag 单调递增，不重命名、不改类型。
 2. **语义向后兼容。** `Revision` 族语义在 v1.0 后冻结。
@@ -123,6 +123,7 @@
 6. **所有新代码 race-free。** `go test -race` 常绿。
 7. **所有公开 API 有 metrics / tracing hook。** 没有 observability 的代码不 merge。
 8. **对外接口必须有显式超时。** 没有超时 = bug。
+9. **Go idiomatic + 业界最佳实践。** 新代码须通过严格 linter 套件（`gofumpt` / `go vet` / `staticcheck` / `golangci-lint` / `goleak` / `govulncheck`）；不仅遵循《Effective Go》《Uber Go Style Guide》《Google Go Style Guide》，还须与 **etcd / CockroachDB / HashiCorp Consul / Kubernetes / Prometheus / gRPC-Go** 等一线开源项目的常见处置对齐——凡偏离，须在 PR 描述里论证。详细规则见 §2.3。
 
 ### 2.2 语义不变量（不能破坏）
 
@@ -131,6 +132,133 @@
 - 删除是第一类操作（`DELETE` event 带 `PrevEntry`），不是"写空"。
 - Watch 永不丢事件 **或** 显式 `compacted=true`（不再静默丢）。
 - Leader 不可用期间，**写**返回 `LEADER_UNAVAILABLE`；**读**不受影响。
+
+### 2.3 代码风格与工程规范
+
+默会知识必须显式化——否则每次 code review 会退化成口味战争。《Effective Go》《Uber Go Style Guide》《Google Go Style Guide》给出基线；真正的功力在一线开源项目的**具体处置**里——它们已经踩过我们即将踩的每一个坑，并在 commit history 里留下了答案。本节把这些共识固化成 PR 可检查的清单。CI 能守的由 CI 守（§H），守不住的由 reviewer 守。
+
+**参考坐标系（按问题查，不必通读）**：
+
+| 问题类别 | 首选参考工程 | 具体看 |
+|---|---|---|
+| Raft FSM / snapshot / 成员变更 | **etcd v3**、**HashiCorp Consul / Nomad**（同用 `hashicorp/raft`） | `etcd/server/etcdserver/apply.go`、`consul/agent/consul/fsm/*` |
+| 分布式 KV + 线性一致读 | **CockroachDB** | `pkg/kv/kvserver/replica_read.go`、`pkg/util/hlc` |
+| Context 传播 + 生命周期 | **Kubernetes** `client-go` | `client-go/tools/leaderelection`、`apimachinery/pkg/util/wait` |
+| Lease / Watch 语义 | **etcd v3** | `server/lease`、`server/mvcc/watchable_store.go` |
+| gRPC interceptor / 错误体系 | **gRPC-Go**、`grpc-ecosystem/go-grpc-middleware` | `status`、`recovery`、`retry` interceptor |
+| Metrics 命名与 histogram | **Prometheus**、**VictoriaMetrics** | `prometheus/client_golang/prometheus/*` |
+| 存储引擎、零拷贝、TX 生命周期 | **bbolt**、**Pebble**（CockroachDB） | 尤其 bbolt `README.md` "Caveats" 章节 |
+| 错误包装与分类 | **CockroachDB** `cockroachdb/errors`、**PingCAP** `pingcap/errors` | 支持 stack trace + 结构化 wrap |
+| 优雅退出 | **containerd / Docker** | `pkg/shutdown`、`cmd/*/main.go` 的信号处置 |
+| 配置系统 | **Caddy**、**Vault** | 热 reload、zero-downtime |
+
+---
+
+#### A. 命名、文件与包组织
+
+- 包名**短、小写、单数**，不要驼峰、不要下划线。反例：`utils / common / helpers / misc`——这些是**设计失败的产物**（Kubernetes 已公开反思 `pkg/util` 的病）。有凝聚力的名字：`raft`、`store`、`lease`、`watch`（我们现在就是对的，别退化）。
+- 每个**导出标识符必须有文档注释**，且以标识符名开头（Go 规范）。`// Why:` 注释只解释设计选择，不解释代码字面——保留代码即文档的信念。
+- **一个文件一个职责**；500 行是软阈值，到了先问自己能不能拆（kubernetes、cockroach 项目都有该文化）。
+- `internal/` 封装不对外 API——Go 1.4+ 原生机制，不靠约定。
+- **禁用 `init()` 做有副作用的事**（etcd 曾因此坑过插件加载顺序）。构造显式 `New...`，依赖注入，不要隐式全局。
+- 不要造 `types.go` / `interfaces.go` / `constants.go` 这种"按语法分类"的文件——按**业务领域**切（CockroachDB 明确反对）。
+
+#### B. 错误处理
+
+- **哨兵错误** 用 `var ErrFoo = errors.New("...")`，调用方用 `errors.Is` 比较——**禁止 `err.Error() == "..."`**（§3.8 Theme H 的核心；linter 强制）。
+- 包装错误：`fmt.Errorf("apply op %q key=%q: %w", opType, key, err)`——带**可行动**的上下文。借鉴 CockroachDB `errors.Wrapf`：每一层都加语义，不是噪音。
+- 复合错误：`errors.Join`（Go 1.20+）或 `hashicorp/go-multierror`——Lease 批量撤销、事务多路失败场景。
+- **错误分类**：区分 `transient`（可退避重试）vs `terminal`（抛给调用方）。借鉴 CockroachDB `errors.IsRetriable`、etcd `rpctypes.ErrGRPC*` 分组。
+- **Never `panic()` in request path**。只在程序启动时不变量被破坏才 panic（参考 etcd `panic("programmer error: ...")` 的用法）。
+- **gRPC handler 的 panic 必须被 interceptor recover** 并转 `codes.Internal` + 告警——直接抄 `grpc-ecosystem/go-grpc-middleware/recovery`。
+- 错误 message：**小写开头、无句号、无换行**（Go 规范）。主语是"what failed"，不是"I tried to ..."。
+
+#### C. 并发与 context
+
+- `context.Context` 是**每个 I/O / RPC / DB / Raft 调用的第一个参数**——任何接口方法没 ctx = API bug，不要变通。
+- Ctx 派生：`ctx, cancel := context.WithTimeout(parent, X); defer cancel()`——`cancel` 的 defer **永远不能省**，否则泄漏。
+- **Ctx 不存 struct field**（Go FAQ 明令；例外：长生命周期 actor 的 `stopCtx`，且必须 `context.Background()` 派生）。
+- **Goroutine 必须有 owner + 退出路径**。参考：
+  - `golang.org/x/sync/errgroup.Group`——一组 goroutine 的标准容器。
+  - `k8s.io/apimachinery/pkg/util/wait.Until`——周期性任务的标准写法。
+  - `uber-go/goleak`——测试断言无泄漏。
+- 并发原语选择：
+  - 关键段用 `sync.Mutex` **零值**；不要 `&sync.Mutex{}` 或指针嵌入。
+  - 读多写少 `sync.RWMutex`——但 bbolt 的教训：读锁也不是免费午餐，profile 后再定。
+  - 单次初始化 `sync.Once`；池化热对象 `sync.Pool`。
+  - 原子小操作用 `atomic.Int64 / atomic.Pointer[T]`（Go 1.19+ typed atomics）——不用老式 `atomic.LoadInt64(&x)`。
+- **Channel 协议**：**sender close, receiver range**——永不反过来。关闭已关闭 channel = panic（参考 etcd 多次 bugfix）。
+- **不要在 goroutine 里裸丢 err**——回传到 owner 或 `logger.Error` 结构化记录，绝不 `_ = doStuff()`（`errcheck` linter 强制）。
+
+#### D. 接口与依赖
+
+- **"Accept interfaces, return structs"** 是起点但不是教条。**不要预置接口**——先有两个具体实现再抽接口（kubernetes 早期"一切皆 interface"的反思）。
+- 小接口优于大接口：`io.Reader` / `io.Writer` 是标杆；`store.Store` 这样的 5–10 方法接口是**上限**。
+- **公开 API 不暴露 `any / interface{}`**——编译期类型安全永远优先。泛型（Go 1.18+）适用即用。
+- **Functional Options** 模式：`func New(opts ...Option) *T`——借鉴 `google.golang.org/grpc`、`uber-go/zap`、`uber-go/fx`。不要 ctor 堆 15 个参数。
+- 避免 "stringly-typed API"——状态用枚举 + `String()`，不要用 raw string 传意图（`"pending" / "done"` 是 code smell）。
+- 构造时**显式依赖注入**（wire / 手工），不要隐式全局 singleton（Vault 的 `cores` 管理是好范例）。
+
+#### E. 性能与内存
+
+- **零拷贝 slice**：bbolt `tx.Get` 返回的 slice 在 tx 生命周期外使用 = UB——必须 `append([]byte(nil), src...)` 或 `bytes.Clone`（Go 1.20+）。bbolt README "Caveats" 明确警告。
+- **预分配容量**：`make([]T, 0, n)` / `make(map[K]V, n)`——go-perfbook 第一课，CockroachDB hot path 遍布。
+- **热路径避免 `defer`**（Go 1.14 后 ~nanoseconds 级，但 Raft Apply 这种每秒万次的循环仍需 profile）；参考 `runtime/mprof.go` 风格：顶层函数无 defer，清理显式写尾部。
+- **`strings.Builder` 替代 `+=`**；字节拼接用 `bytes.Buffer` 或 `[]byte` append。
+- **`sync.Pool`** 化 hot allocations——proto buffer、`WatchResponse`、`bytes.Buffer`（gRPC-Go 大规模使用）。记住 Pool 不是 cache，GC 可能随时清空。
+- **Struct field alignment**：大字段在前、atomic 字段开头确保 8-byte 对齐——`fieldalignment` linter 自动检查（对 64-bit atomic 在 32-bit 平台是**正确性**问题，不是优化）。
+- 不要在 tight loop 里 `time.Now()` 做累计——用一次 `start := time.Now()` + `time.Since(start)`。
+- 避免反射热路径（`reflect.DeepEqual` 在比较已知类型时换手写）——Prometheus / CockroachDB 都有 benchmark 驱动的换手写案例。
+
+#### F. 测试规范
+
+- **Table-driven tests** 是 Go 社区默认——stdlib / etcd / kubernetes 一致。每个 case 一行 struct，子测试用 `t.Run(name, ...)` 方便 `-run` 过滤。
+- **禁止 `time.Sleep` 做同步**——用 channel、条件变量、或 `testify/assert.Eventually`（带超时 polling）。"sleep-based test" = flaky test，是 CI 噩梦的单一最大来源。
+- **`goleak.VerifyNone(t)`** 放在 `TestMain` 或关键测试尾——uber 开源，kubernetes / cockroach 广用。
+- **Golden file testing** 用于协议契约：`testdata/*.golden`，`-update` flag 再生。stdlib `go/format`、k8s `apiserver` 都是这风格——最适合我们的 pb wire 兼容回归。
+- **集成测试独立 build tag**：`//go:build integration`，CI 分层跑（快测 < 1 分钟，集成 < 10 分钟）。
+- **Fuzz** 覆盖 parser / codec / watch range 路径（Go 1.18+ native）——etcd、cockroach 都在走。
+- **Race detector 常绿** = 约束 #6，但单说一遍：`go test -race ./...` 不绿禁止 merge。
+- **不要 mock 得过深**——k8s 的 envtest、etcd 的 `integration/` 都倾向"起真实子系统"而非层层 mock；mock 只 mock 外部网络边界。
+
+#### G. 日志、度量、追踪
+
+- 日志框架：`log/slog`（Go 1.21+ stdlib）。**禁用** `stdlib log.Printf` / `logrus`——前者无结构化，后者 allocation 重。`slog` 足以替代 `zap` 的 95% 场景，stdlib 无依赖。
+- **Structured only**：`logger.Info("apply done", "key", k, "rev", r, "dur_ms", d)`，**不要** `log.Printf("apply done key=%s rev=%d", k, r)`——后者无法被日志系统字段化索引。
+- 日志级别约定：
+  - `Debug` —— 仅在诊断模式；生产默认关。
+  - `Info` —— 关键状态变更（leader change、snapshot 完成）。不用 info 打"正常请求"——那是 metric 的职责。
+  - `Warn` —— 可自恢复但值得注意（client 重试、ctx deadline 近了）。
+  - `Error` —— 需人工介入或影响 SLO；必须可 alert。
+- **禁记敏感字段 value**：key 可 log（便于排错），value、token、password 默认脱敏；`--log-values` debug flag 才开（借鉴 Vault 的 "audit log redaction"）。
+- **Metric 命名** 严守 Prometheus 最佳实践：`<namespace>_<subsystem>_<name>_<unit>` 全小写下划线。
+  - 对：`paladin_raft_apply_duration_seconds`
+  - 错：`paladinRaftApplyMs` / `paladin.raft.apply.latency`
+- **Histogram bucket** 跟业务分布：延迟多用 `prometheus.ExponentialBucketsRange(0.0001, 10, 20)`；字节数用 `prometheus.ExponentialBuckets(64, 4, 10)`。**不要用 `DefBuckets`**——它是 HTTP 假设。
+- **Trace span 命名** `<component>.<operation>`：`raft.apply`、`bolt.tx`、`watch.dispatch`。`traceparent` 通过 gRPC / HTTP interceptor 自动传递，业务代码不手工处理（otelgrpc / otelhttp）。
+- 每次打日志 / 记 metric **都要问**："凌晨 3 点 oncall 的人，看到这条能定位到哪行代码吗？"
+
+#### H. 工具链与 CI 强制
+
+| 工具 | 用途 | 强制阶段 |
+|---|---|---|
+| `gofumpt` | `gofmt` 超集（更严） | pre-commit + CI |
+| `go vet` | 标准静态检查 | CI |
+| `staticcheck` | bug + style 深度检查 | CI |
+| `golangci-lint` | 聚合运行：`errcheck / govet / ineffassign / gosec / revive / gocritic / misspell / bodyclose / contextcheck / errorlint / nilerr / exhaustive / unconvert / unparam / prealloc / fieldalignment / gofumpt` | CI（不绿禁 merge） |
+| `goleak` | goroutine 泄漏断言 | `go test` 内 |
+| `govulncheck` | 官方 CVE 扫描 | CI + nightly cron |
+| `go-licenses` | 依赖 license 合规 | CI |
+| `buf lint` | protobuf 风格 + breaking 检测 | CI（wire 改动触发） |
+| `benchstat` | bench 数字对比基线 | PR comment 自动贴 |
+
+基线配置：
+
+- `.golangci.yml` 入仓（参考 CockroachDB / kubernetes 的配置做裁剪起点）。
+- `.editorconfig` 统一缩进 / 行尾。
+- `Makefile` 或 `scripts/lint.sh`：`make lint` 本地一键全跑，等价 CI 的子集。
+- PR 模板带 checkbox："☐ `make lint` 本地通过   ☐ 新代码有测试   ☐ 破坏性变更已在 CHANGELOG 标记"。
+- **人为豁免**任一 linter rule 须在 `//nolint:rule // reason: ...` 内写理由——CI 检查 "reason" 非空；无理由豁免视同 linter 未过。
 
 ---
 
@@ -646,6 +774,7 @@ Stale p99 ≤ 5ms，Consistent p99 ≤ 15ms。
 - `paladin.yaml` 配置 + env 覆盖；CLI flag 仅作 YAML sugar。
 - 错误码枚举 + gRPC status 包；CI lint 禁用 `err.Error() ==` 字符串比较。
 - OTLP SDK 注入；HTTP interceptor 至少有 `rpc.server` span。
+- **Linter 套件接入**（§2.3.H）：`.golangci.yml` + `gofumpt` + `staticcheck` + `goleak` + `govulncheck` + `buf lint`；`make lint` 一键；PR 不绿禁 merge。
 
 **Exit**：
 
