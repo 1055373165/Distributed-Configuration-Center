@@ -12,7 +12,7 @@
 
 *etcd's core ideas, Consul's leader-forwarding, Ctrip Paladin's SDK lifecycle — distilled to something you can read in a weekend.*
 
-[**Quickstart**](#quickstart) · [**Architecture**](#architecture) · [**API**](#http-api) · [**SDK**](#go-sdk) · [**7-Day Study Guide**](#7-day-study-guide) · [**Design Decisions**](#design-decisions)
+[**Quickstart**](#quickstart) · [**Architecture**](#architecture) · [**API**](#http-api) · [**SDK**](#go-sdk) · [**Benchmarks**](#benchmarks) · [**7-Day Study Guide**](#7-day-study-guide) · [**Design Decisions**](#design-decisions)
 
 </div>
 
@@ -364,6 +364,59 @@ Part of learning is breaking things on purpose. Reproduce these in 30 seconds ea
 
 ---
 
+## Benchmarks
+
+A small, repo-native load-testing toolkit lives in [`bench/`](bench/) with its
+own [README](bench/README.md) covering design choices (per-worker histograms,
+timestamp-driven warm-up, SLO-driven interpretation). Build with
+`go build -o paladin-bench ./cmd/paladin-bench` and reproduce everything below
+in about 30 seconds.
+
+### Reference numbers
+
+3-node localhost cluster (`./scripts/cluster-local.sh`), single-laptop
+measurement, concurrency = 16, 3 s measurement window after 500 ms warm-up,
+64 B values. Numbers are **illustrative of the shape** of the system, not
+absolute limits — your hardware will move every column.
+
+| Scenario       | Endpoints | RPS        | P50    | P95      | P99      | P99.9    | Max      | Errors |
+| -------------- | --------- | ---------: | -----: | -------: | -------: | -------: | -------: | -----: |
+| `write_only`   | leader    |         55 |  221ms |    523ms |    541ms |    542ms |    542ms |      0 |
+| `read_only`    | 3 nodes   |     94 335 |  150µs |    350µs |    550µs |   1.05ms |   9.18ms |      0 |
+| `mixed_95r_5w` | 3 nodes   |      1 566 |  250µs |   42.6ms |    174ms |    200ms |    213ms |      0 |
+
+*Environment: Go 1.23.3, darwin/arm64, 12 cores, APFS SSD, `fsync=on`.*
+
+What the numbers actually say — three architect-level observations:
+
+1. **1 700× read/write ratio is the Raft + fsync signature.** Writes pay the
+   full price of log replication + quorum + a synchronous bbolt commit; reads
+   skip all of it. This is the structural reason configuration centers are
+   read-heavy by design.
+2. **Write p99 ≈ 540 ms at c=16** means the knee point is at c < 16 — the
+   cluster is queuing. Your reported *safe* write QPS should be the value at
+   the concurrency one step below the knee, not the peak RPS.
+3. **Mixed p99 = 174 ms** even with 95 % reads. Five percent writes are enough
+   to dominate the tail — this is the direct motivation for the
+   `raft.ApplyBatch` item on the [roadmap](#roadmap).
+
+### Reproduce
+
+```bash
+go build -o paladin-bench ./cmd/paladin-bench
+./scripts/cluster-local.sh --fresh
+./scripts/bench-suite.sh                              # ramp conc × 3 scenarios
+# or one scenario at a time:
+./paladin-bench run --scenario=write_only  --addrs=127.0.0.1:8080 --concurrency=16
+./paladin-bench run --scenario=read_only   --addrs=127.0.0.1:8080,127.0.0.1:8081,127.0.0.1:8082
+./paladin-bench run --scenario=mixed --read-percent=95 --addrs=127.0.0.1:8080
+```
+
+Finding your own knee: sweep concurrency and look for where RPS plateaus
+while p99 blows up (see [bench/README.md](bench/README.md#finding-the-knee-point)).
+
+---
+
 ## Roadmap
 
 Small, intentional, non-committal:
@@ -376,6 +429,8 @@ Small, intentional, non-committal:
 - [ ] Chaos test suite (`jepsen`-flavored, in-repo)
 
 If you would like any of these and are willing to contribute, open a discussion first.
+
+For the full production-grade refactoring blueprint — SLO targets, architectural themes (A–H), phased rollout, risk matrix, chaos playbook, and proto schema drafts — see **[docs/production-refactoring.md](docs/production-refactoring.md)**.
 
 ---
 

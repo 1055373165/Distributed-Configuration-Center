@@ -1,8 +1,12 @@
 # ---- Go 编译产物 ----
 /paladin-core
+/paladin-bench
 *.exe
 *.test
 *.out
+
+# ---- 压测结果（本地运行产物，committed baselines 放 bench/baselines/）----
+/bench/results/
 
 # ---- 数据库文件 ----
 paladin-core.db
