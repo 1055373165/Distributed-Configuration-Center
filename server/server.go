@@ -25,28 +25,31 @@ type Server struct {
 	mux   *http.ServeMux
 }
 
-// New creates a new Server backend by the given Store.
-// If the store is a Watchable Store, the watch endpoint is enabled.
+// New creates a new Server backed by the given Store.
+// If the store is a WatchableStore, the watch endpoint is enabled.
 func New(s store.Store) *Server {
-	srv := &Server{store: s, mux: http.NewServeMux()}
-	// If the store is watchable, grab the WatchCache.
-	if ws, ok := s.(*store.WatchableStore); ok {
-		srv.wc = ws.WatchCache()
-	}
-	srv.routes()
+	srv := newBase(s)
+	srv.mux.HandleFunc("/api/v1/config/", srv.handleConfig)
 	return srv
 }
 
-func (s *Server) routes() {
-	s.mux.HandleFunc("/api/v1/config", s.handleConfig)
-	s.mux.HandleFunc("/api/v1/rev", s.handleRev)
-	if s.wc != nil {
-		s.registerWatchRoutes()
+// newBase wires every route except /api/v1/config/, so wrappers like
+// RaftServer can install their own config handler without colliding.
+// Net/http's ServeMux panics on duplicate patterns since Go 1.22.
+func newBase(s store.Store) *Server {
+	srv := &Server{store: s, mux: http.NewServeMux()}
+	if ws, ok := s.(*store.WatchableStore); ok {
+		srv.wc = ws.WatchCache()
 	}
-	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	srv.mux.HandleFunc("/api/v1/rev", srv.handleRev)
+	if srv.wc != nil {
+		srv.registerWatchRoutes()
+	}
+	srv.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+	return srv
 }
 
 // ServeHTTP implements http.Handler

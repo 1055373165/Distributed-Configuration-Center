@@ -21,7 +21,7 @@ func NewRaftServer(node *praft.Node) *RaftServer {
 	// Build the base server WITHOUT /api/v1/config/ — newBase skips it so
 	// we can install the Raft-aware handler here without a duplicate-pattern
 	// panic from net/http.ServeMux. Do NOT switch this to New(...).
-	base := New(node.Store())
+	base := newBase(node.Store())
 
 	rs := &RaftServer{Server: base, node: node}
 

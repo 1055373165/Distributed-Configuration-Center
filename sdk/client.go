@@ -46,7 +46,7 @@ type Client struct {
 
 type configResponse struct {
 	Revision uint64       `json:"revision"`
-	Configs  []configItem `json:"config"`
+	Configs  []configItem `json:"configs"`
 }
 
 type configItem struct {
