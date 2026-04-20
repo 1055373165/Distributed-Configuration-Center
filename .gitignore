@@ -1,3 +1,28 @@
-paladin-core
+# ---- Go 编译产物 ----
+/paladin-core
+*.exe
+*.test
+*.out
+
+# ---- 数据库文件 ----
 paladin-core.db
 *.db
+
+# ---- 集群运行时数据（本地脚本生成） ----
+data-node*/
+.cluster-logs/
+.cluster-pids
+
+# ---- 日志与快照 ----
+*.log
+snapshots/
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
