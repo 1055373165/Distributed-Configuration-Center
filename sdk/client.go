@@ -13,12 +13,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"paladin-core/internal/logger"
 )
 
 // Config holds SDK configuration.
@@ -42,6 +46,8 @@ type Client struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	client   *http.Client
+	log      *slog.Logger
+	metrics  *clientMetrics
 }
 
 type configResponse struct {
@@ -82,11 +88,13 @@ func New(cfg Config) (*Client, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 		client:   &http.Client{Timeout: cfg.PollTimeout + 5*time.Second},
+		log:      logger.L("sdk").With("tenant", cfg.Tenant, "namespace", cfg.Namespace),
+		metrics:  newClientMetrics(cfg.Tenant, cfg.Namespace),
 	}
 	if err := c.fullPull(); err != nil {
-		log.Printf("[SDK] full pull failed: %v, trying cache", err)
+		c.log.Warn("full pull failed, falling back to cache", "err", err)
 		if cacheErr := c.loadFromCache(); cacheErr != nil {
-			log.Printf("[SDK] cache load failed: %v", cacheErr)
+			c.log.Error("cache load failed", "err", cacheErr)
 		}
 	}
 	c.wg.Add(1)
@@ -123,7 +131,31 @@ func (c *Client) Close() {
 	c.wg.Wait()
 }
 
-func (c *Client) fullPull() error {
+// MetricsRegistry returns the Prometheus registry scoped to this Client.
+// Expose it alongside your app's own metrics, e.g.:
+//
+//	http.Handle("/sdk-metrics",
+//	    promhttp.HandlerFor(c.MetricsRegistry(), promhttp.HandlerOpts{}))
+//
+// Or merge with other registries via prometheus.Gatherers. See
+// `sdk/metrics.go` for the list of exposed series.
+func (c *Client) MetricsRegistry() *prometheus.Registry {
+	return c.metrics.registry
+}
+
+func (c *Client) fullPull() (err error) {
+	start := time.Now()
+	// Named return + deferred metrics block keeps the instrumentation out
+	// of the existing error-return sites below.
+	defer func() {
+		c.metrics.fullPullDuration.Observe(time.Since(start).Seconds())
+		outcome := "ok"
+		if err != nil {
+			outcome = "error"
+		}
+		c.metrics.fullPullsTotal.WithLabelValues(outcome).Inc()
+	}()
+
 	url := fmt.Sprintf("http://%s/api/v1/config/%s/%s",
 		c.pickAddr(),
 		c.config.Tenant,
@@ -147,9 +179,12 @@ func (c *Client) fullPull() error {
 		c.configs[item.Key] = []byte(item.Value)
 	}
 	c.revision = cr.Revision
+	count := len(c.configs)
 	c.mu.Unlock()
+	c.metrics.revision.Set(float64(cr.Revision))
+	c.metrics.configs.Set(float64(count))
 	c.saveToCache()
-	log.Printf("[SDK] full pull: %d configs, rev=%d", len(cr.Configs), cr.Revision)
+	c.log.Info("full pull complete", "count", len(cr.Configs), "rev", cr.Revision)
 	return nil
 }
 
@@ -168,27 +203,44 @@ func (c *Client) watchLoop() {
 			c.pickAddr(), c.config.Tenant, c.config.Namespace,
 			rev, int(c.config.PollTimeout.Seconds()),
 		)
+		start := time.Now()
 		resp, err := c.client.Get(url)
 		if err != nil {
-			log.Printf("[SDK] watch error: %v, retry in %v", err, c.config.RetryBackoff)
+			c.metrics.watchPollDuration.Observe(time.Since(start).Seconds())
+			c.metrics.watchPollsTotal.WithLabelValues("error").Inc()
+			c.log.Warn("watch request failed, retrying", "err", err, "backoff", c.config.RetryBackoff)
 			c.sleep(c.config.RetryBackoff)
 			continue
 		}
 		var wr watchResponse
 		if err := json.NewDecoder(resp.Body).Decode(&wr); err != nil {
-			log.Printf("[SDK] decode watch response error: %v", err)
+			c.metrics.watchPollDuration.Observe(time.Since(start).Seconds())
+			c.metrics.watchPollsTotal.WithLabelValues("error").Inc()
+			c.log.Error("decode watch response", "err", err)
+			resp.Body.Close()
 			continue
 		}
 		resp.Body.Close()
+		c.metrics.watchPollDuration.Observe(time.Since(start).Seconds())
+		outcome := "empty"
+		if len(wr.Events) > 0 {
+			outcome = "events"
+		}
+		c.metrics.watchPollsTotal.WithLabelValues(outcome).Inc()
 
 		if len(wr.Events) > 0 {
 			c.applyEvents(wr.Events)
 			c.saveToCache()
+			c.mu.RLock()
+			count := len(c.configs)
+			c.mu.RUnlock()
+			c.metrics.configs.Set(float64(count))
 		}
 		if wr.Revision > 0 {
 			c.mu.Lock()
 			c.revision = wr.Revision
 			c.mu.Unlock()
+			c.metrics.revision.Set(float64(wr.Revision))
 		}
 	}
 }
@@ -207,13 +259,14 @@ func (c *Client) applyEvents(events []watchEvent) {
 			delete(c.configs, key)
 			newVal = nil
 		}
+		c.metrics.watchEventsTotal.WithLabelValues(e.Type).Inc()
 		for _, fn := range c.watchers[key] {
 			fn(key, oldVal, newVal)
 		}
 		for _, fn := range c.watchers[""] {
 			fn(key, oldVal, newVal)
 		}
-		log.Printf("[SDK] %s %s", e.Type, key)
+		c.log.Debug("event applied", "type", e.Type, "key", key)
 	}
 }
 
@@ -264,18 +317,22 @@ func (c *Client) saveToCache() {
 func (c *Client) loadFromCache() error {
 	path := c.cachePath()
 	if path == "" {
+		c.metrics.cacheLoadsTotal.WithLabelValues("error").Inc()
 		return fmt.Errorf("no cache dir")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		c.metrics.cacheLoadsTotal.WithLabelValues("error").Inc()
 		return err
 	}
 	var cf cacheFile
 	if err := json.Unmarshal(data, &cf); err != nil {
+		c.metrics.cacheLoadsTotal.WithLabelValues("error").Inc()
 		return fmt.Errorf("corrupt cache: %w", err)
 	}
 	cfgData, _ := json.Marshal(cf.Configs)
 	if sha256Sum(cfgData) != cf.CheckSum {
+		c.metrics.cacheLoadsTotal.WithLabelValues("checksum_mismatch").Inc()
 		return fmt.Errorf("cache checksum mismatch")
 	}
 	c.mu.Lock()
@@ -283,8 +340,12 @@ func (c *Client) loadFromCache() error {
 		c.configs[k] = []byte(v)
 	}
 	c.revision = cf.Revision
+	count := len(c.configs)
 	c.mu.Unlock()
-	log.Printf("[SDK] loaded %d configs from cache (rev=%d)", len(cf.Configs), cf.Revision)
+	c.metrics.cacheLoadsTotal.WithLabelValues("ok").Inc()
+	c.metrics.revision.Set(float64(cf.Revision))
+	c.metrics.configs.Set(float64(count))
+	c.log.Info("loaded from cache", "count", len(cf.Configs), "rev", cf.Revision)
 	return nil
 }
 

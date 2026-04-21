@@ -30,7 +30,7 @@ type WatchEvent struct {
 // RegisterWatchRoutes adds the watch endpoint.
 // Called from server.routes() - separated for clarity.
 func (s *Server) registerWatchRoutes() {
-	s.mux.HandleFunc("/api/v1/watch/", s.handleWatch)
+	s.handleFunc("/api/v1/watch/", s.handleWatch)
 }
 
 // handleWatch implements HTTP long polling for configuration changes.

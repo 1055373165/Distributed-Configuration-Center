@@ -1,0 +1,144 @@
+# PaladinCore linter configuration.
+#
+# See docs/production-refactoring.md §2.3.H for rationale.
+# Baseline derived from CockroachDB / kubernetes configs, trimmed for our scale.
+#
+# Any //nolint must include a `// reason: ...` — plain //nolint is rejected in review.
+
+run:
+  timeout: 3m
+  tests: true
+  go: "1.23"
+
+output:
+  sort-results: true
+
+linters:
+  disable-all: true
+  enable:
+    # Correctness
+    - errcheck # unchecked errors
+    - govet # stdlib vet
+    - staticcheck # deep static analysis
+    - ineffassign # ineffective assignments
+    - typecheck # required
+    - unused # dead code
+
+    # Style / idioms
+    - gofumpt # stricter gofmt
+    - revive # golint successor
+    - gocritic # diagnostic + idiomatic checks
+    - misspell # typo hunter
+    - unconvert # redundant type conversions
+    - unparam # unused function params
+    - prealloc # slice preallocation hints
+
+    # Go correctness traps
+    - bodyclose # http.Response.Body.Close
+    - contextcheck # ctx propagation
+    - errorlint # errors.Is / errors.As patterns, %w wrap
+    - nilerr # returning nil err with non-nil result or vice versa
+    - exhaustive # exhaustive switch on enums
+    - rowserrcheck # sql rows.Err
+    - sqlclosecheck # sql rows.Close
+
+    # Security
+    - gosec # security anti-patterns
+
+    # Note: fieldalignment is intentionally NOT enabled globally.
+    # Run it selectively on hot types via `go vet -vettool=$(which fieldalignment)` instead —
+    # blanket enforcement produces noise that obscures genuine cache-line issues.
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment # run selectively on hot types, not globally
+      - shadow # too noisy for now; revisit
+
+  staticcheck:
+    checks: ["all"]
+
+  revive:
+    severity: warning
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+        arguments: ["checkPrivateReceivers", "disableStutteringCheck"]
+      - name: if-return
+      - name: increment-decrement
+      - name: var-declaration
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unexported-return
+      - name: indent-error-flow
+      - name: errorf
+      - name: empty-block
+      - name: superfluous-else
+      - name: unused-parameter
+        disabled: true # unparam covers this more precisely
+      - name: unreachable-code
+      - name: redefines-builtin-id
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+    disabled-checks:
+      - ifElseChain # sometimes clearer than switch
+      - singleCaseSwitch # intentional when planning to add cases
+
+  misspell:
+    locale: US
+
+  errorlint:
+    errorf: true
+    asserts: true
+    comparison: true
+
+  exhaustive:
+    default-signifies-exhaustive: true
+
+  gosec:
+    excludes:
+      - G101 # hardcoded credentials: false positives on test fixtures
+      - G104 # Audited elsewhere by errcheck
+      - G204 # subprocess from user input: covered in review
+    config:
+      G301: "0750"
+      G302: "0600"
+
+issues:
+  exclude-rules:
+    # Tests can be looser
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+        - unparam
+        - gocritic
+
+    # Generated code is exempt
+    - path: \.pb\.go$
+      linters:
+        - all
+
+  # Disallow bare //nolint — must carry `// reason:` clause (enforced in review,
+  # no linter directly blocks this; the exclude-use-default is about inherited
+  # suppression, not about reason text).
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0

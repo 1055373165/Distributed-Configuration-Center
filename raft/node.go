@@ -19,12 +19,14 @@ import (
 	"io"
 	"net"
 	"os"
-	"paladin-core/store"
 	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+
+	"paladin-core/internal/metrics"
+	"paladin-core/store"
 )
 
 // Op represents an operation to be replicated through Raft.
@@ -36,10 +38,17 @@ type Op struct {
 }
 
 // OpResult is the result of applying an Op.
+//
+// OpResult is returned in-process via raft.ApplyFuture.Response() on the
+// submitting (leader) node only — it is NOT serialized or replicated.
+// That lets us carry a typed `error` and preserve sentinels like
+// store.ErrKeyNotFound through the call chain, so callers can use
+// errors.Is instead of fragile string matching.
 type OpResult struct {
 	Entry     *store.Entry `json:"entry,omitempty"`
 	PrevEntry *store.Entry `json:"prev_entry,omitempty"`
-	Error     string       `json:"error,omitempty"`
+	// Err is never JSON-marshaled; it only lives on the leader's goroutine.
+	Err error `json:"-"`
 }
 
 // NodeConfig holds configuration for a Raft node.
@@ -155,8 +164,10 @@ func (n *Node) Apply(op Op, timeout time.Duration) (*OpResult, error) {
 		return nil, fmt.Errorf("unexpected response type: %T", future.Response())
 	}
 
-	if result.Error != "" {
-		return nil, fmt.Errorf("apply error: %s", result.Error)
+	if result.Err != nil {
+		// Wrap with %w so callers can errors.Is against store sentinels
+		// (e.g. store.ErrKeyNotFound) without caring about the raft layer.
+		return nil, fmt.Errorf("raft fsm apply: %w", result.Err)
 	}
 
 	return result, nil
@@ -287,19 +298,23 @@ type FSM struct {
 	store *store.WatchableStore
 }
 
-// Apply is called by Raft when a log entry is committed.
+// Apply is called by Raft when a log entry is committed. It runs on every
+// node (leader and followers) after quorum, so it's the right place to push
+// replicated state into metrics — anything observed here is guaranteed to be
+// durably committed.
 func (f *FSM) Apply(log *raft.Log) interface{} {
 	var op Op
 	if err := json.Unmarshal(log.Data, &op); err != nil {
-		return &OpResult{Error: fmt.Sprintf("unmarshal op: %v", err)}
+		return &OpResult{Err: fmt.Errorf("unmarshal op: %w", err)}
 	}
 
 	switch op.Type {
 	case "put":
 		result, err := f.store.Put(op.Key, op.Value)
 		if err != nil {
-			return &OpResult{Error: fmt.Sprintf("unmarshal op: %v", err)}
+			return &OpResult{Err: fmt.Errorf("store put: %w", err)}
 		}
+		metrics.StoreRevision.Set(float64(result.Entry.Revision))
 		return &OpResult{
 			Entry:     result.Entry,
 			PrevEntry: result.PrevEntry,
@@ -307,11 +322,13 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	case "delete":
 		deleted, err := f.store.Delete(op.Key)
 		if err != nil {
-			return &OpResult{Error: err.Error()}
+			// Preserve the sentinel (e.g. store.ErrKeyNotFound) for errors.Is.
+			return &OpResult{Err: err}
 		}
+		metrics.StoreRevision.Set(float64(f.store.Rev()))
 		return &OpResult{Entry: deleted}
 	default:
-		return &OpResult{Error: fmt.Sprintf("unknown op type: %s", op.Type)}
+		return &OpResult{Err: fmt.Errorf("unknown op type: %q", op.Type)}
 	}
 }
 
@@ -343,6 +360,9 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 			return fmt.Errorf("restore key %s: %w", e.Key, err)
 		}
 	}
+	// Reflect the post-restore revision so scrapes after snapshot install
+	// don't show a stale / zero value.
+	metrics.StoreRevision.Set(float64(f.store.Rev()))
 	return nil
 }
 

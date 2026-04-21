@@ -77,9 +77,20 @@ EOF
 check_ports
 
 # --- Build binary if missing / stale ---
-MAIN="$ROOT/cmd/paladin-core/main.go"
-if [ ! -x "$BIN" ] || [ "$MAIN" -nt "$BIN" ]; then
-  echo "==> building paladin-core"
+# Previously we only checked cmd/paladin-core/main.go which missed edits in
+# raft/, server/, store/, internal/* etc — leading to confusing "why is my
+# fix not live?" moments. Compare against the newest .go file in the tree.
+need_build=0
+if [ ! -x "$BIN" ]; then
+  need_build=1
+else
+  newest_src=$(find "$ROOT" -name '*.go' -not -path '*/data-node*/*' -newer "$BIN" -print -quit 2>/dev/null || true)
+  if [ -n "$newest_src" ]; then
+    need_build=1
+  fi
+fi
+if [ "$need_build" -eq 1 ]; then
+  echo "==> building paladin-core (sources newer than binary)"
   (cd "$ROOT" && go build -o paladin-core ./cmd/paladin-core)
 fi
 

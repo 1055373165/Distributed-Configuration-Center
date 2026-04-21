@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"errors"
+	"paladin-core/store"
 	"testing"
 	"time"
 )
@@ -103,6 +105,23 @@ func TestRaftWatchIntegration(t *testing.T) {
 	}
 	if string(events[0].Entry.Value) != "v1" {
 		t.Fatalf("expected value 'v1', got '%s'", string(events[0].Entry.Value))
+	}
+}
+
+// TestRaftDeleteMissingKey_PreservesSentinel is the regression test for the
+// string-matched-error bug in server/raft_server.go. FSM.Apply used to stuff
+// err.Error() into OpResult.Error (string), forcing callers to do fragile
+// prefix matches like `err.Error() == "apply error: key not found"`. Now the
+// sentinel propagates via %w so errors.Is works end-to-end.
+func TestRaftDeleteMissingKey_PreservesSentinel(t *testing.T) {
+	n := singleNode(t)
+
+	_, err := n.Apply(Op{Type: "delete", Key: "does-not-exist"}, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error for deleting missing key, got nil")
+	}
+	if !errors.Is(err, store.ErrKeyNotFound) {
+		t.Fatalf("expected errors.Is(err, store.ErrKeyNotFound); got %v", err)
 	}
 }
 

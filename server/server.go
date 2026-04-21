@@ -12,10 +12,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
-	"paladin-core/store"
 	"strings"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"paladin-core/internal/logger"
+	"paladin-core/internal/metrics"
+	"paladin-core/store"
 )
 
 // Server is the HTTP API server for PaladinCore.
@@ -23,13 +28,14 @@ type Server struct {
 	store store.Store
 	wc    *store.WatchCache
 	mux   *http.ServeMux
+	log   *slog.Logger
 }
 
 // New creates a new Server backed by the given Store.
 // If the store is a WatchableStore, the watch endpoint is enabled.
 func New(s store.Store) *Server {
 	srv := newBase(s)
-	srv.mux.HandleFunc("/api/v1/config/", srv.handleConfig)
+	srv.handleFunc("/api/v1/config/", srv.handleConfig)
 	return srv
 }
 
@@ -37,19 +43,33 @@ func New(s store.Store) *Server {
 // RaftServer can install their own config handler without colliding.
 // Net/http's ServeMux panics on duplicate patterns since Go 1.22.
 func newBase(s store.Store) *Server {
-	srv := &Server{store: s, mux: http.NewServeMux()}
+	srv := &Server{
+		store: s,
+		mux:   http.NewServeMux(),
+		log:   logger.L("server"),
+	}
 	if ws, ok := s.(*store.WatchableStore); ok {
 		srv.wc = ws.WatchCache()
 	}
-	srv.mux.HandleFunc("/api/v1/rev", srv.handleRev)
+	srv.handleFunc("/api/v1/rev", srv.handleRev)
 	if srv.wc != nil {
 		srv.registerWatchRoutes()
 	}
-	srv.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	srv.handleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+	// /metrics is served directly by promhttp, NOT wrapped in the request-
+	// counting middleware — self-observation adds noise without signal.
+	srv.mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	return srv
+}
+
+// handleFunc registers an HTTP handler wrapped in the metrics middleware.
+// The route pattern is used verbatim as the metric label to keep cardinality
+// bounded; never pass a raw URL here.
+func (s *Server) handleFunc(pattern string, fn http.HandlerFunc) {
+	s.mux.Handle(pattern, metrics.Middleware(pattern, fn))
 }
 
 // ServeHTTP implements http.Handler
@@ -165,7 +185,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, tenant, names
 		Configs:  []*ConfigItem{entryToConfig(result.Entry)},
 	})
 
-	log.Printf("[PUT] %s rev=%d ver=%d", key, result.Entry.Revision, result.Entry.Version)
+	metrics.StoreRevision.Set(float64(result.Entry.Revision))
+	s.log.Info("put applied", "key", key, "rev", result.Entry.Revision, "ver", result.Entry.Version)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, tenant, namespace, name string) {
@@ -186,7 +207,8 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, tenant, na
 		Configs:  []*ConfigItem{entryToConfig(deleted)},
 	})
 
-	log.Printf("[DELETE] %s rev=%d", key, s.store.Rev())
+	metrics.StoreRevision.Set(float64(s.store.Rev()))
+	s.log.Info("delete applied", "key", key, "rev", s.store.Rev())
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request, tenant, namespace string) {

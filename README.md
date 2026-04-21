@@ -12,7 +12,7 @@
 
 *etcd's core ideas, Consul's leader-forwarding, Ctrip Paladin's SDK lifecycle — distilled to something you can read in a weekend.*
 
-[**Quickstart**](#quickstart) · [**Architecture**](#architecture) · [**API**](#http-api) · [**SDK**](#go-sdk) · [**Benchmarks**](#benchmarks) · [**7-Day Study Guide**](#7-day-study-guide) · [**Design Decisions**](#design-decisions)
+[**Quickstart**](#quickstart) · [**Architecture**](#architecture) · [**API**](#http-api) · [**SDK**](#go-sdk) · [**Observability**](#observability) · [**Benchmarks**](#benchmarks) · [**7-Day Study Guide**](#7-day-study-guide) · [**Design Decisions**](#design-decisions)
 
 </div>
 
@@ -364,6 +364,84 @@ Part of learning is breaking things on purpose. Reproduce these in 30 seconds ea
 
 ---
 
+## Observability
+
+Every node exposes Prometheus metrics on `/metrics` and emits structured
+`log/slog` records keyed by subsystem (`cmd`, `server`, `sdk`). Full design
+rationale is in [`docs/production-refactoring.md`](docs/production-refactoring.md)
+§2.3.H / §3.B.
+
+### Metrics
+
+```text
+paladin_http_requests_total{method,route,status}           # counter  (RED)
+paladin_http_request_duration_seconds{method,route}        # histogram (RED)
+paladin_raft_apply_total{op,outcome}                       # counter
+paladin_raft_apply_duration_seconds{op}                    # histogram
+paladin_store_revision                                     # gauge, replicated
+```
+
+`paladin_store_revision` is updated inside the FSM, so followers also reflect
+the true committed revision — scrape *any* node and diff the gauge to spot
+replication lag. Go runtime + process collectors are enabled for free heap /
+goroutine / FD visibility.
+
+### SDK metrics
+
+The Go SDK exposes its own per-`Client` Prometheus registry — no shared
+globals, no conflicts when an app runs several `Client`s (one per
+tenant/namespace). Wire it into your app's scrape endpoint:
+
+```go
+c, _ := sdk.New(sdk.Config{Addrs: addrs, Tenant: "public", Namespace: "prod"})
+defer c.Close()
+http.Handle("/sdk-metrics",
+    promhttp.HandlerFor(c.MetricsRegistry(), promhttp.HandlerOpts{}))
+```
+
+```text
+paladin_sdk_full_pulls_total{outcome,tenant,namespace}            # counter
+paladin_sdk_full_pull_duration_seconds{tenant,namespace}          # histogram
+paladin_sdk_watch_polls_total{outcome,tenant,namespace}           # counter
+paladin_sdk_watch_poll_duration_seconds{tenant,namespace}         # histogram
+paladin_sdk_watch_events_total{type,tenant,namespace}             # counter
+paladin_sdk_cache_loads_total{outcome,tenant,namespace}           # counter
+paladin_sdk_revision{tenant,namespace}                            # gauge
+paladin_sdk_configs{tenant,namespace}                             # gauge
+```
+
+`tenant` and `namespace` are `ConstLabels`, not per-observation labels — that
+keeps hot-path overhead to a bare `Inc()` while still letting you tell
+multiple SDK clients apart in the same process. Diff
+`paladin_sdk_revision` against the server's `paladin_store_revision` to
+quantify client-side staleness.
+
+Quick check:
+
+```bash
+./scripts/cluster-local.sh --fresh
+for i in 1 2 3; do
+  curl -s -X PUT http://127.0.0.1:8080/api/v1/config/public/prod/k$i -d "v$i" > /dev/null
+done
+for h in 8080 8081 8082; do
+  curl -s http://127.0.0.1:$h/metrics | grep '^paladin_store_revision '
+done
+# all three should report the same revision once replication catches up
+```
+
+### Logs
+
+```bash
+PALADIN_LOG_FORMAT=json PALADIN_LOG_LEVEL=info ./paladin-core cluster --id node1 ...
+# {"time":"...","level":"INFO","msg":"raft put applied","subsystem":"server","key":"public/prod/k1","rev":4}
+```
+
+Supported env vars: `PALADIN_LOG_LEVEL` (`debug|info|warn|error`),
+`PALADIN_LOG_FORMAT` (`text|json`; defaults to `text` on a TTY, `json`
+otherwise).
+
+---
+
 ## Benchmarks
 
 A small, repo-native load-testing toolkit lives in [`bench/`](bench/) with its
@@ -423,7 +501,7 @@ Small, intentional, non-committal:
 
 - [ ] `?consistent=true` linearizable reads via `raft.VerifyLeader`
 - [ ] Batched writes (`raft.ApplyBatch`)
-- [ ] Prometheus `/metrics` endpoint with Raft + store histograms
+- [x] Prometheus `/metrics` endpoint with Raft + store histograms (shipped — see [Observability](#observability))
 - [ ] Go SDK: round-robin + health-aware endpoint selection (currently uses `Addrs[0]`)
 - [ ] Java / Python SDK mirrors with identical wire contract
 - [ ] Chaos test suite (`jepsen`-flavored, in-repo)

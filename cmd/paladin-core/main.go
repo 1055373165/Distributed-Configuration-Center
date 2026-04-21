@@ -11,15 +11,21 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
+
+	"paladin-core/internal/logger"
 	praft "paladin-core/raft"
 	"paladin-core/server"
 	"paladin-core/store"
-	"strings"
-	"time"
 )
+
+// log is the command-level logger. Using a package-level var is acceptable
+// here because main.go is the single entry point and has no library consumers
+// to worry about. PALADIN_LOG_LEVEL / PALADIN_LOG_FORMAT env vars tune it.
+var log = logger.L("cmd")
 
 const defaultDBPath = "paladin-core.db"
 
@@ -57,7 +63,7 @@ func runStandalone() {
 	defer ws.Close()
 
 	srv := server.New(ws)
-	log.Printf("PaladinCore [standalone] on %s", addr)
+	log.Info("PaladinCore starting", "mode", "standalone", "addr", addr)
 	if err := http.ListenAndServe(addr, srv); err != nil {
 		fatal("listen: %v", err)
 	}
@@ -166,7 +172,7 @@ func runCluster() {
 		if resp.StatusCode != 200 {
 			fatal("join cluster: status %d", resp.StatusCode)
 		}
-		log.Printf("Joined cluster via %s", *join)
+		log.Info("joined cluster", "via", *join)
 	}
 
 	// Bootstrap node self-registers its HTTP addr once it wins election so
@@ -174,22 +180,27 @@ func runCluster() {
 	if *bootstrap {
 		go func() {
 			if err := node.WaitForLeader(10 * time.Second); err != nil {
-				log.Printf("self-register: %v", err)
+				log.Warn("self-register: wait for leader failed", "err", err)
 				return
 			}
 			if !node.IsLeader() {
 				return // someone else became leader (shouldn't happen on bootstrap)
 			}
 			if err := node.RegisterPeerHTTP(*nodeID, advertiseHTTP); err != nil {
-				log.Printf("self-register: %v", err)
+				log.Error("self-register failed", "err", err)
 				return
 			}
-			log.Printf("Self-registered %s -> %s", *nodeID, advertiseHTTP)
+			log.Info("self-registered", "node", *nodeID, "http_addr", advertiseHTTP)
 		}()
 	}
 
-	log.Printf("PaladinCore [raft] node=%s raft=%s http=%s bootstrap=%v",
-		*nodeID, *raftAddr, *httpAddr, *bootstrap)
+	log.Info("PaladinCore starting",
+		"mode", "raft",
+		"node", *nodeID,
+		"raft_addr", *raftAddr,
+		"http_addr", *httpAddr,
+		"bootstrap", *bootstrap,
+	)
 	if err := http.ListenAndServe(*httpAddr, srv); err != nil {
 		fatal("listen: %v", err)
 	}

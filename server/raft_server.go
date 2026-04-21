@@ -2,12 +2,15 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	praft "paladin-core/raft"
 	"time"
+
+	"paladin-core/internal/metrics"
+	praft "paladin-core/raft"
+	"paladin-core/store"
 )
 
 // RaftServer extends Server with Raft awaareness.
@@ -26,12 +29,12 @@ func NewRaftServer(node *praft.Node) *RaftServer {
 	rs := &RaftServer{Server: base, node: node}
 
 	// Install the Raft-aware config handler.
-	rs.mux.HandleFunc("/api/v1/config/", rs.handleRaftConfig)
+	rs.handleFunc("/api/v1/config/", rs.handleRaftConfig)
 	// Watch still works the same (reads from WatchCache).
 	// Admin endpoints.
-	rs.mux.HandleFunc("/admin/join", rs.handleJoin)
-	rs.mux.HandleFunc("/admin/leave", rs.handleLeave)
-	rs.mux.HandleFunc("/admin/stats", rs.handleStats)
+	rs.handleFunc("/admin/join", rs.handleJoin)
+	rs.handleFunc("/admin/leave", rs.handleLeave)
+	rs.handleFunc("/admin/stats", rs.handleStats)
 	return rs
 }
 
@@ -83,16 +86,22 @@ func (rs *RaftServer) handleRaftPut(w http.ResponseWriter, r *http.Request, tena
 
 	// If not leader, forward to leader.
 	if !rs.node.IsLeader() {
+		metrics.RaftApplyTotal.WithLabelValues("put", "not_leader").Inc()
 		rs.forwardToLeader(w, r, body)
 		return
 	}
 
 	op := praft.Op{Type: "put", Key: key, Value: body}
+	start := time.Now()
 	result, err := rs.node.Apply(op, 5*time.Second)
+	metrics.RaftApplyDuration.WithLabelValues("put").Observe(time.Since(start).Seconds())
 	if err != nil {
+		metrics.RaftApplyTotal.WithLabelValues("put", "error").Inc()
 		httpError(w, http.StatusInternalServerError, "raft apply: %v", err)
 		return
 	}
+	metrics.RaftApplyTotal.WithLabelValues("put", "ok").Inc()
+	// store_revision gauge is updated inside FSM.Apply so followers track it too.
 
 	status := http.StatusOK
 	if result.PrevEntry == nil {
@@ -104,7 +113,7 @@ func (rs *RaftServer) handleRaftPut(w http.ResponseWriter, r *http.Request, tena
 		Revision: result.Entry.Revision,
 		Configs:  []*ConfigItem{entryToConfig(result.Entry)},
 	})
-	log.Printf("[Raft PUT] %s rev=%d", key, result.Entry.Revision)
+	rs.log.Info("raft put applied", "key", key, "rev", result.Entry.Revision)
 }
 
 func (rs *RaftServer) handleRaftDelete(w http.ResponseWriter, r *http.Request, tenant, namespace, name string) {
@@ -112,26 +121,34 @@ func (rs *RaftServer) handleRaftDelete(w http.ResponseWriter, r *http.Request, t
 
 	// If not leader, forward to leader.
 	if !rs.node.IsLeader() {
+		metrics.RaftApplyTotal.WithLabelValues("delete", "not_leader").Inc()
 		rs.forwardToLeader(w, r, nil)
 		return
 	}
 
 	op := praft.Op{Type: "delete", Key: key}
+	start := time.Now()
 	result, err := rs.node.Apply(op, 5*time.Second)
+	metrics.RaftApplyDuration.WithLabelValues("delete").Observe(time.Since(start).Seconds())
 	if err != nil {
-		if err.Error() == "apply error: key not found" {
+		metrics.RaftApplyTotal.WithLabelValues("delete", "error").Inc()
+		// errors.Is walks the %w chain, so a renamed wrapper message upstream
+		// can't silently turn a 404 into a 500.
+		if errors.Is(err, store.ErrKeyNotFound) {
 			httpError(w, http.StatusNotFound, "key not found: %s", key)
 			return
 		}
 		httpError(w, http.StatusInternalServerError, "raft apply: %v", err)
 		return
 	}
+	metrics.RaftApplyTotal.WithLabelValues("delete", "ok").Inc()
+	// store_revision gauge is updated inside FSM.Apply so followers track it too.
 
 	writeJSON(w, http.StatusOK, &ConfigResponse{
 		Revision: rs.node.Rev(),
 		Configs:  []*ConfigItem{entryToConfig(result.Entry)},
 	})
-	log.Printf("[RAFT DELETE] %s", key)
+	rs.log.Info("raft delete applied", "key", key)
 }
 
 // forwardToLeader proxies the request to the current Raft leader.
@@ -189,7 +206,12 @@ func (rs *RaftServer) forwardToLeader(w http.ResponseWriter, r *http.Request, bo
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 
-	log.Printf("[FORWARD] %s %s -> leader %s (status %d)", r.Method, r.URL.Path, leaderHTTP, resp.StatusCode)
+	rs.log.Info("request forwarded to leader",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"leader", leaderHTTP,
+		"status", resp.StatusCode,
+	)
 }
 
 // --- Admin Endpoints (Day 5/7) ---
@@ -216,7 +238,7 @@ func (rs *RaftServer) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "joined": nodeID})
-	log.Printf("[ADMIN] node %s raft=%s http=%s joined", nodeID, addr, httpAddr)
+	rs.log.Info("node joined cluster", "node", nodeID, "raft_addr", addr, "http_addr", httpAddr)
 }
 
 func (rs *RaftServer) handleLeave(w http.ResponseWriter, r *http.Request) {
@@ -235,7 +257,7 @@ func (rs *RaftServer) handleLeave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "removed": nodeID})
-	log.Printf("[ADMIN] node %s left", nodeID)
+	rs.log.Info("node left cluster", "node", nodeID)
 }
 
 func (rs *RaftServer) handleStats(w http.ResponseWriter, r *http.Request) {
