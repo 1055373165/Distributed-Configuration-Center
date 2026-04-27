@@ -620,7 +620,7 @@ v1.0 release 的硬 gate = P6 chaos 清 0 违反。
 
 | KPI | 定义 | 基线（v0） | 目标（v2.0） | 采集 | 频率 |
 |---|---|---:|---:|---|---|
-| 写 RPS @ conc=64, p99≤50ms | `bench/scenarios/write_only` 拐点一步下 | ~55 | **≥ 3000** | bench quick-suite | 每 PR |
+| 写 RPS @ conc=64, p99≤50ms | `bench/scenarios/write_only` 拐点一步下 | ~55 ⚠️[^kpi-write] | **≥ 3000** ⚠️[^kpi-write-target] | bench quick-suite | 每 PR |
 | 读 RPS @ conc=64, p99≤5ms | `bench/scenarios/read_only` 拐点一步下 | ~94k | **≥ 200k** | bench quick-suite | 每 PR |
 | 混合 RPS @ 95/5, conc=64 | `mixed` scenario | ~1.5k | **≥ 30k** | bench quick-suite | 每 PR |
 | 非测试代码 LOC | `find . -name '*.go' \! -name '*_test.go' \| xargs wc -l` | ~3800 | **≤ 6000** | CI `make loc-budget` | 每 PR |
@@ -632,6 +632,10 @@ v1.0 release 的硬 gate = P6 chaos 清 0 违反。
 | **Linearizability 违反数** | chaos full suite 中 porcupine 报告的违反次数 | 未测 | **= 0** | CI `paladin_chaos_test_linearizability_violations_total` | 每 nightly |
 | **Chaos scenario 覆盖** | 每发布必过的 scenario 数 | 0 | **≥ 10** | `chaos/scenarios/` 计数 | 每发布 |
 | **技术文章交付数** | P7 精选章节 | 0 | **= 5** | `docs/articles/*.md` 计数 | 每发布 |
+
+[^kpi-write]: **基线列脚注**（P0 OV1 2026-04-22 laptop 测量发现）：原 "~55" 来自无 SLO 约束下的历史测量（p99 可达 523ms）。在严格 `p99≤50ms` SLO 下，laptop（darwin/arm64, APFS）c=1 即已 p99=68ms，**不存在合规数据点**。laptop c=8 knee 为 65 RPS @ p99=229ms。Linux NVMe 复测估算 c=8 knee ≈ 500–1000 RPS @ p99≤50ms。**P1 kickoff 前必须 Linux 复测并把本列替换为真实 SLO-constrained 数字**。详见 `docs/p0-raft-ceiling.md`。
+
+[^kpi-write-target]: **目标列脚注**（P0 OV2 2026-04-22 校验）：3000 RPS 基于 "Linux baseline 500–1000 + BatchProposer 5–8x" 的推算，落在 2500–8000 的估算区间中位。若 Linux 实测 c=8 knee < 400 RPS，本目标**下修到 2000 RPS** 或放宽 SLO 到 p99≤100ms，不虚报。详见 `docs/p0-raft-pipelining.md`。
 
 ### 5.2 健康度监控
 
