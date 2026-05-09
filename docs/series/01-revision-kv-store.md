@@ -25,6 +25,8 @@ type Entry struct {
 }
 ```
 
+.venv/bin/python3 backend/scripts/backfill_signal_observations.py --full --concurrency 4
+
 **Level 2(怎么做).** 关键在**这四个字段如何被一致地维护**。答案在 `store/bolt.go:68-131` 的 `Put`:读旧值、递增 revision、写入新值、持久化 revision 四步**必须在同一个 BoltDB 事务内完成**。事务未提交时的崩溃保留旧状态,一旦提交四件事同时可见。
 
 **Level 3(为什么这样).** 为什么不能"先写数据、再更新 revision"?因为一旦两次写入之间崩溃,要么出现"数据已写但 rev 没涨"(变更对 Watch 消失),要么"rev 涨了但数据没写"(重启后 rev 回退,新写入撞上已用号码,单调性塌方)。事务的作用就是把两件事压进一个**原子点**。
